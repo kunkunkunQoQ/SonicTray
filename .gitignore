@@ -13,3 +13,6 @@ assets/RCb*
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Temporary comparison images
+tools/_cmp*.png

@@ -1,22 +1,23 @@
-"""生成 Sonic Tray 的四个多尺寸 ICO 资源（以及 exe 图标）。
+"""生成 Sonic Tray 的多尺寸 ICO 资源（4 个音量等级 × 浅/深主题）。
 
-图形按 Windows 11 音量图标的视觉比例手工绘制：实心扬声器 + 右侧两道圆弧（正常），
-或实心扬声器 + 右侧叉号（静音）。每个尺寸独立光栅化（8 倍超采样后 LANCZOS 缩小），
-因此 16/20/24/32 px 下边缘依然清晰。
+图形按 Windows 11 托盘音量图标的视觉比例手绘：**描边的扬声器** + 若干道声波，
+静音时把声波换成叉号。扬声器部分在所有等级中完全一致，只有声波数量变化。
+
+每个尺寸独立光栅化（8 倍超采样后 LANCZOS 缩小），因此 16/20/24/32 px 下
+线条依然分开、不粘连。
 
 输出（assets/）：
-    volume_light.ico  浅色任务栏用（深色图形）
-    volume_dark.ico   深色任务栏用（浅色图形）
-    mute_light.ico    浅色任务栏用（深色图形）
-    mute_dark.ico     深色任务栏用（浅色图形）
-    app.ico           exe 自身图标（含 256 尺寸 PNG 帧）
+    volume_muted_light.ico / volume_low_light.ico / volume_medium_light.ico / volume_high_light.ico
+    volume_muted_dark.ico  / volume_low_dark.ico  / volume_medium_dark.ico  / volume_high_dark.ico
+    app.ico（exe 图标，含 256 PNG 帧）
 
 用法：
-    python tools/gen_icons.py            # 生成 assets/*.ico 与 tools/icon_preview.png
+    python tools/gen_icons.py     # 同时输出 tools/icon_preview.png 供目视检查
 """
 
 from __future__ import annotations
 
+import io
 import math
 import os
 import struct
@@ -30,62 +31,75 @@ ICON_SIZES = (16, 20, 24, 32, 40, 48, 64)
 GLYPH_DARK = (0x17, 0x17, 0x17)   # 浅色任务栏上的深色图形
 GLYPH_LIGHT = (0xFF, 0xFF, 0xFF)  # 深色任务栏上的浅色图形
 
-# --- 几何参数（24×24 栅格）------------------------------------------------
-BODY_BOX = (2.2, 9.2, 6.4, 14.8)   # 扬声器箱体
-BODY_RADIUS = 0.85
-CONE = ((6.0, 9.2), (11.6, 3.4), (13.0, 4.4), (13.0, 19.6), (11.6, 20.6), (6.0, 14.8))
-WAVE_CENTER = (13.3, 12.0)
-WAVE_RADII = (3.5, 7.1)
-WAVE_HALF_ANGLE = 45.0             # 度
-WAVE_STROKE = 1.95
-X_STROKE = 2.1
-X_BOX = (15.3, 9.3, 21.0, 15.0)
+# --- 扬声器（描边，所有等级完全一致）--------------------------------------
+SPEAKER_PATH = ((0.9, 9.0), (4.4, 9.0), (9.4, 4.3), (9.4, 19.7), (4.4, 15.0), (0.9, 15.0))
+SPEAKER_STROKE = 1.5
+
+# --- 声波（同心圆弧，从内向外依次出现）------------------------------------
+WAVE_CENTER = (9.0, 12.0)
+WAVE_RADII = (4.9, 9.4, 13.9)
+WAVE_HALF_ANGLE = 38.0
+WAVE_STROKE = 1.5
+
+# --- 静音叉号 -------------------------------------------------------------
+X_LINES = ((14.2, 8.2, 21.4, 15.4), (21.4, 8.2, 14.2, 15.4))
+X_STROKE = 1.6
+
+#: 等级名 -> 声波数量（0 表示画叉号）
+LEVELS = (("muted", 0), ("low", 1), ("medium", 2), ("high", 3))
 
 
-def _stroke_arc(draw: ImageDraw.ImageDraw, center, radius, half_angle, stroke, color, u):
-    """用圆点沿弧线铺点，得到带圆头端帽的均匀描边。"""
-    steps = max(12, int(radius * half_angle))
-    dab = stroke * u
+def _disc(draw: ImageDraw.ImageDraw, x: float, y: float, radius: float, color, u: float) -> None:
+    r = radius * u
+    draw.ellipse(((x * u) - r, (y * u) - r, (x * u) + r, (y * u) + r), fill=color)
+
+
+def _stroke_path(draw, points, stroke: float, color, u: float) -> None:
+    """闭合折线描边：直线段 + 顶点圆点，得到圆角连接。"""
+    pts = [(x * u, y * u) for x, y in points]
+    width = max(1, int(round(stroke * u)))
+    draw.line(pts + [pts[0]], fill=color, width=width, joint="curve")
+    for x, y in points:
+        _disc(draw, x, y, stroke / 2.0, color, u)
+
+
+def _stroke_arc(draw, center, radius: float, half_angle: float, stroke: float, color, u: float) -> None:
+    """圆弧描边：沿弧线铺圆点，端点自然是圆头。"""
+    steps = max(16, int(radius * half_angle))
     for i in range(steps + 1):
-        ang = math.radians(-half_angle + 2.0 * half_angle * i / steps)
-        x = (center[0] + radius * math.cos(ang)) * u
-        y = (center[1] + radius * math.sin(ang)) * u
-        r = dab / 2.0
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+        angle = math.radians(-half_angle + 2.0 * half_angle * i / steps)
+        _disc(
+            draw,
+            center[0] + radius * math.cos(angle),
+            center[1] + radius * math.sin(angle),
+            stroke / 2.0,
+            color,
+            u,
+        )
 
 
-def _stroke_line(draw: ImageDraw.ImageDraw, p0, p1, stroke, color, u):
-    """粗线 + 两端圆帽。"""
-    draw.line((p0[0] * u, p0[1] * u, p1[0] * u, p1[1] * u), fill=color, width=max(1, int(round(stroke * u))))
-    r = stroke * u / 2.0
-    for p in (p0, p1):
-        draw.ellipse((p[0] * u - r, p[1] * u - r, p[0] * u + r, p[1] * u + r), fill=color)
+def _stroke_line(draw, x0: float, y0: float, x1: float, y1: float, stroke: float, color, u: float) -> None:
+    draw.line((x0 * u, y0 * u, x1 * u, y1 * u), fill=color, width=max(1, int(round(stroke * u))))
+    _disc(draw, x0, y0, stroke / 2.0, color, u)
+    _disc(draw, x1, y1, stroke / 2.0, color, u)
 
 
-def render(size: int, color: tuple[int, int, int], muted: bool) -> Image.Image:
+def render(size: int, color: tuple[int, int, int], waves: int) -> Image.Image:
     """在给定像素尺寸下渲染一张 RGBA 图标。"""
     px = size * SS
     img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     u = px / GRID
-    fill = color + (255,)
+    ink = color + (255,)
 
-    # 扬声器：箱体 + 锥体
-    draw.rounded_rectangle(
-        [BODY_BOX[0] * u, BODY_BOX[1] * u, BODY_BOX[2] * u, BODY_BOX[3] * u],
-        radius=BODY_RADIUS * u,
-        fill=fill,
-    )
-    draw.polygon([(x * u, y * u) for x, y in CONE], fill=fill)
+    _stroke_path(draw, SPEAKER_PATH, SPEAKER_STROKE, ink, u)
 
-    if muted:
-        p0 = (X_BOX[0], X_BOX[1])
-        p1 = (X_BOX[2], X_BOX[3])
-        _stroke_line(draw, p0, p1, X_STROKE, fill, u)
-        _stroke_line(draw, (p1[0], p0[1]), (p0[0], p1[1]), X_STROKE, fill, u)
+    if waves == 0:
+        for x0, y0, x1, y1 in X_LINES:
+            _stroke_line(draw, x0, y0, x1, y1, X_STROKE, ink, u)
     else:
-        for radius in WAVE_RADII:
-            _stroke_arc(draw, WAVE_CENTER, radius, WAVE_HALF_ANGLE, WAVE_STROKE, fill, u)
+        for radius in WAVE_RADII[:waves]:
+            _stroke_arc(draw, WAVE_CENTER, radius, WAVE_HALF_ANGLE, WAVE_STROKE, ink, u)
 
     return img.resize((size, size), Image.LANCZOS)
 
@@ -106,8 +120,6 @@ def _bmp_frame(img: Image.Image) -> bytes:
 
 
 def _png_frame(img: Image.Image) -> bytes:
-    import io
-
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
@@ -132,39 +144,36 @@ def write_ico(path: str, frames: list[tuple[int, bytes]]) -> None:
         fp.write(header + bytes(entries) + bytes(payload))
 
 
-def build(path: str, color: tuple[int, int, int], muted: bool, with_256: bool = False) -> None:
-    frames = [(s, _bmp_frame(render(s, color, muted))) for s in ICON_SIZES]
+def build(path: str, color: tuple[int, int, int], waves: int, with_256: bool = False) -> None:
+    frames = [(s, _bmp_frame(render(s, color, waves))) for s in ICON_SIZES]
     if with_256:
-        frames.append((256, _png_frame(render(256, color, muted))))
+        frames.append((256, _png_frame(render(256, color, waves))))
     write_ico(path, frames)
 
 
 def build_preview(path: str) -> None:
-    """生成人工检查用的预览图：4 种状态 × 实际尺寸 / 放大视图。"""
-    cell_w, cell_h = 96, 96
-    pad = 12
-    cols = [
-        (16, 1), (20, 1), (24, 1), (32, 1),   # 真实像素尺寸
-        (16, 4), (24, 3), (32, 2),            # 2~4 倍放大，便于看形状
-    ]
-    rows = [
-        ("volume on light", (244, 244, 244), GLYPH_DARK, False),
-        ("mute on light", (244, 244, 244), GLYPH_DARK, True),
-        ("volume on dark", (32, 32, 32), GLYPH_LIGHT, False),
-        ("mute on dark", (32, 32, 32), GLYPH_LIGHT, True),
-    ]
+    """人工检查用：4 个等级 × 2 种主题，含实际尺寸与放大视图。"""
+    cell_w, cell_h = 104, 104
+    pad = 10
+    cols = [(16, 1), (20, 1), (24, 1), (32, 1), (16, 4), (24, 3), (32, 2)]
+    rows = [(name, waves, theme) for theme in ("light", "dark") for name, waves in LEVELS]
     width = pad * 2 + cell_w * len(cols)
     height = pad * 2 + cell_h * len(rows)
-    sheet = Image.new("RGB", (width, height), (128, 128, 128))
-    for row, (_label, bg, color, muted) in enumerate(rows):
+    sheet = Image.new("RGB", (width, height), (120, 120, 120))
+
+    for row, (_name, waves, theme) in enumerate(rows):
+        light_bg = theme == "light"
+        bg = (244, 244, 244) if light_bg else (32, 32, 32)
+        ink = GLYPH_DARK if light_bg else GLYPH_LIGHT
         top = pad + row * cell_h
         ImageDraw.Draw(sheet).rectangle([pad, top, width - pad, top + cell_h - 4], fill=bg)
         for col, (size, scale) in enumerate(cols):
-            icon = render(size, color, muted)
+            icon = render(size, ink, waves)
             big = icon if scale == 1 else icon.resize((size * scale, size * scale), Image.NEAREST)
             x = pad + col * cell_w + (cell_w - big.width) // 2
             y = top + (cell_h - 4 - big.height) // 2
             sheet.paste(big, (x, y), big)
+
     sheet.save(path)
 
 
@@ -173,17 +182,16 @@ def main() -> None:
     assets = os.path.join(root, "assets")
     os.makedirs(assets, exist_ok=True)
 
-    build(os.path.join(assets, "volume_light.ico"), GLYPH_DARK, muted=False)
-    build(os.path.join(assets, "mute_light.ico"), GLYPH_DARK, muted=True)
-    build(os.path.join(assets, "volume_dark.ico"), GLYPH_LIGHT, muted=False)
-    build(os.path.join(assets, "mute_dark.ico"), GLYPH_LIGHT, muted=True)
-    build(os.path.join(assets, "app.ico"), GLYPH_DARK, muted=False, with_256=True)
-    build_preview(os.path.join(root, "tools", "icon_preview.png"))
+    for theme, color in (("light", GLYPH_DARK), ("dark", GLYPH_LIGHT)):
+        for name, waves in LEVELS:
+            path = os.path.join(assets, f"volume_{name}_{theme}.ico")
+            build(path, color, waves)
+            print(f"{os.path.basename(path):26s} {os.path.getsize(path):7d} bytes")
 
-    for name in ("volume_light.ico", "mute_light.ico", "volume_dark.ico", "mute_dark.ico", "app.ico"):
-        p = os.path.join(assets, name)
-        print(f"{name:18s} {os.path.getsize(p):7d} bytes")
-    print("icon_preview.png 生成于 tools/")
+    app_icon = os.path.join(assets, "app.ico")
+    build(app_icon, GLYPH_DARK, waves=3, with_256=True)
+    print(f"{'app.ico':26s} {os.path.getsize(app_icon):7d} bytes")
+    build_preview(os.path.join(root, "tools", "icon_preview.png"))
 
 
 if __name__ == "__main__":

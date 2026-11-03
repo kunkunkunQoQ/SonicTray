@@ -1,12 +1,8 @@
-//! Core Audio 监听。
+//! Core Audio 监听：默认播放设备的静音状态与主音量。
 //!
-//! 职责：获取「默认播放设备（eRender/eConsole）」的静音状态与主音量，
-//! 并通过 Windows Core Audio 的事件通知（`IAudioEndpointVolumeCallback` /
-//! `IMMNotificationClient`）感知变化。
-//!
-//! 线程模型：所有 COM 对象都在主线程创建与使用（MTA）。音频服务的回调可能
-//! 运行在任意线程，因此回调内部**只做一件事**——向隐藏窗口 PostMessage，
-//! 真正的读取与界面刷新都在主线程的消息处理里完成。
+//! 所有 COM 对象都在主线程创建与使用（MTA）。音频服务的回调可能运行在任意线程，
+//! 因此回调内部**只做一件事**——向隐藏窗口 PostMessage，真正的读取与刷新都在
+//! 主线程的消息处理里完成。
 
 use windows::core::{implement, PCWSTR, Result as WinResult, BOOL, GUID};
 use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, WPARAM};
@@ -28,28 +24,54 @@ pub const WM_DEVICE_CHANGED: u32 = WM_APP + 11;
 /// `MMDeviceEnumerator` 的 CLSID（windows crate 未导出该常量）。
 const CLSID_MMDEVICE_ENUMERATOR: GUID = GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
 
-/// 主音量低于该阈值即视为「音量为 0」。
-const SILENCE_THRESHOLD: f32 = 0.0001;
-
-/// 托盘需要展示的两种状态。
+/// 图标等级。静音优先级最高，其次按音量百分比分档。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AudioState {
-    Normal,
+pub enum VolumeState {
     Muted,
+    Low,
+    Medium,
+    High,
 }
 
-/// 状态判定：**静音标志为真，或主音量为 0** 时显示静音图标。
-///
-/// 音量为 0 只改变本程序的显示，绝不去动系统的静音标志。
-pub fn decide(muted: bool, volume: f32) -> AudioState {
-    if muted || volume <= SILENCE_THRESHOLD {
-        AudioState::Muted
-    } else {
-        AudioState::Normal
+impl VolumeState {
+    /// 图标资源数组下标。
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Muted => 0,
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+        }
     }
 }
 
-/// 把「状态可能变了」投递给主线程的隐藏窗口。可以在任意线程调用。
+/// 一次读取的完整状态。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Snapshot {
+    /// 系统静音标志。与「音量为 0」是两件事，提示文字需要区分。
+    pub muted: bool,
+    pub percent: u32,
+    pub state: VolumeState,
+}
+
+/// 唯一的等级判定入口。
+///
+/// 静音或 0% → `Muted`；1–33 低、34–66 中、67–100 高（分界为项目近似值）。
+pub fn evaluate(muted: bool, volume: f32) -> Snapshot {
+    let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as u32;
+    let state = if muted || percent == 0 {
+        VolumeState::Muted
+    } else if percent <= 33 {
+        VolumeState::Low
+    } else if percent <= 66 {
+        VolumeState::Medium
+    } else {
+        VolumeState::High
+    };
+    Snapshot { muted, percent, state }
+}
+
+/// 把「状态可能变了」投递给主线程的隐藏窗口，可在任意线程调用。
 fn wake(hwnd: isize, msg: u32) {
     if hwnd == 0 {
         return;
@@ -94,7 +116,6 @@ impl IMMNotificationClient_Impl for DeviceNotify_Impl {
     }
 
     fn OnDeviceRemoved(&self, _id: &PCWSTR) -> WinResult<()> {
-        // 被移除的可能正是当前默认设备，需要重新绑定。
         wake(self.hwnd, WM_DEVICE_CHANGED);
         Ok(())
     }
@@ -108,18 +129,17 @@ impl IMMNotificationClient_Impl for DeviceNotify_Impl {
     }
 
     fn OnPropertyValueChanged(&self, _id: &PCWSTR, _key: &PROPERTYKEY) -> WinResult<()> {
-        // 属性变化（改名、图标等）与静音状态无关。
         Ok(())
     }
 }
 
-/// 当前绑定的默认设备及其音量接口 + 已注册的回调（必须成对持有，注销时要用同一实例）。
+/// 当前绑定的默认设备：音量接口 + 已注册的回调（注销时必须用同一实例）。
 struct Binding {
     volume: IAudioEndpointVolume,
     callback: IAudioEndpointVolumeCallback,
 }
 
-/// 默认播放设备的静音状态监听器。
+/// 默认播放设备的状态监听器。
 pub struct AudioMonitor {
     enumerator: IMMDeviceEnumerator,
     client: Option<IMMNotificationClient>,
@@ -128,7 +148,7 @@ pub struct AudioMonitor {
 }
 
 impl AudioMonitor {
-    /// 创建监听器并注册设备变化通知。设备暂时不可用不会导致失败。
+    /// 创建监听器并注册设备变化通知。设备暂时不可用不算失败。
     pub fn new(hwnd: HWND) -> WinResult<Self> {
         let hwnd = hwnd.0 as isize;
         unsafe {
@@ -143,13 +163,11 @@ impl AudioMonitor {
                 binding: None,
                 hwnd,
             };
-            // 音频服务可能尚未就绪，绑定失败交由看门狗重试。
             let _ = monitor.bind();
             Ok(monitor)
         }
     }
 
-    /// 绑定当前默认播放设备，并注册音量变化回调。
     fn bind(&mut self) -> WinResult<()> {
         unsafe {
             let device = self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
@@ -169,28 +187,26 @@ impl AudioMonitor {
                     .volume
                     .UnregisterControlChangeNotify(&binding.callback);
             }
-            // binding 在此处析构：回调与音量接口的引用计数各自减一。
         }
     }
 
-    /// 读取当前状态。读取失败返回 `None`（调用方必须保持原图标，不能当作未静音）。
-    pub fn read(&self) -> Option<AudioState> {
+    /// 读取当前状态。读取失败返回 `None`（调用方保持原图标，不能当作未静音）。
+    pub fn read(&self) -> Option<Snapshot> {
         let binding = self.binding.as_ref()?;
         unsafe {
             let muted: BOOL = binding.volume.GetMute().ok()?;
             let volume: f32 = binding.volume.GetMasterVolumeLevelScalar().ok()?;
-            Some(decide(muted.as_bool(), volume))
+            Some(evaluate(muted.as_bool(), volume))
         }
     }
 
-    /// 读取状态；读失败或强制重绑时，先解除旧回调再绑定新设备后重试一次。
+    /// 读取状态；读失败或 `force_rebind` 时先解绑再重绑后重试一次。
     ///
-    /// `force_rebind` 用于「默认设备已切换」的场景：旧设备可能仍然可读，
-    /// 但读到的已经不是当前默认设备的数值。
-    pub fn sync(&mut self, force_rebind: bool) -> Option<AudioState> {
+    /// `force_rebind` 用于「默认设备已切换」：旧设备可能仍可读，但数值已不属于当前设备。
+    pub fn sync(&mut self, force_rebind: bool) -> Option<Snapshot> {
         if !force_rebind {
-            if let Some(state) = self.read() {
-                return Some(state);
+            if let Some(snapshot) = self.read() {
+                return Some(snapshot);
             }
         }
         self.unbind();
@@ -216,17 +232,39 @@ impl Drop for AudioMonitor {
 mod tests {
     use super::*;
 
-    /// 覆盖需求 4.1 判定表的每一行。
+    fn state_of(muted: bool, volume: f32) -> VolumeState {
+        evaluate(muted, volume).state
+    }
+
+    /// 覆盖需求里的分级表与静音优先级。
     #[test]
-    fn decision_table_matches_spec() {
-        assert_eq!(decide(false, 0.50), AudioState::Normal);
-        assert_eq!(decide(false, 1.00), AudioState::Normal);
-        assert_eq!(decide(false, 0.00), AudioState::Muted);
-        assert_eq!(decide(true, 0.50), AudioState::Muted);
-        assert_eq!(decide(true, 1.00), AudioState::Muted);
-        // 取消静音且音量大于 0 → 恢复正常
-        assert_eq!(decide(false, 0.02), AudioState::Normal);
-        // 极小但非零的音量仍按正常显示
-        assert_eq!(decide(false, 0.001), AudioState::Normal);
+    fn level_table() {
+        assert_eq!(state_of(false, 0.00), VolumeState::Muted);
+        assert_eq!(state_of(false, 0.10), VolumeState::Low);
+        assert_eq!(state_of(false, 0.30), VolumeState::Low);
+        assert_eq!(state_of(false, 0.33), VolumeState::Low);
+        assert_eq!(state_of(false, 0.34), VolumeState::Medium);
+        assert_eq!(state_of(false, 0.50), VolumeState::Medium);
+        assert_eq!(state_of(false, 0.66), VolumeState::Medium);
+        assert_eq!(state_of(false, 0.67), VolumeState::High);
+        assert_eq!(state_of(false, 0.80), VolumeState::High);
+        assert_eq!(state_of(false, 1.00), VolumeState::High);
+        // 静音优先于任何音量
+        assert_eq!(state_of(true, 0.85), VolumeState::Muted);
+        assert_eq!(state_of(true, 1.00), VolumeState::Muted);
+    }
+
+    /// 百分比与「静音标志」是两件事，提示文字要能区分。
+    #[test]
+    fn percent_and_muted_flag() {
+        let loud = evaluate(true, 0.65);
+        assert_eq!(loud.percent, 65);
+        assert!(loud.muted);
+        assert_eq!(loud.state, VolumeState::Muted);
+
+        let zero = evaluate(false, 0.0);
+        assert_eq!(zero.percent, 0);
+        assert!(!zero.muted);
+        assert_eq!(zero.state, VolumeState::Muted);
     }
 }

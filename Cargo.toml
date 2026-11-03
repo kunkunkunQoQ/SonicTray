@@ -1,6 +1,6 @@
 [package]
 name = "sonic-tray"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Windows 系统静音状态托盘指示器（Sonic Tray）"

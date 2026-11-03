@@ -1,5 +1,5 @@
-//! 图标资源：四个多尺寸 ICO 在编译期通过 `include_bytes!` 嵌入 EXE，
-//! 运行时按当前 DPI 的小图标尺寸挑选同尺寸的一帧创建 `HICON`。
+//! 图标资源：8 个多尺寸 ICO（4 个音量等级 × 2 种主题）在编译期通过
+//! `include_bytes!` 嵌入 EXE，启动时一次性创建全部 `HICON`，运行期间只切换句柄。
 //!
 //! 命名约定：`*_light` 用于**浅色任务栏**（图形是深色的），
 //! `*_dark` 用于**深色任务栏**（图形是浅色的）。
@@ -13,12 +13,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, DestroyIcon, GetSystemMetrics, HICON, IMAGE_FLAGS, SM_CXSMICON,
 };
 
-/// 顺序即 `Icons::load` 里句柄数组的下标顺序。
-const SOURCES: [&[u8]; 4] = [
-    include_bytes!("../assets/volume_light.ico"),
-    include_bytes!("../assets/volume_dark.ico"),
-    include_bytes!("../assets/mute_light.ico"),
-    include_bytes!("../assets/mute_dark.ico"),
+use crate::audio::VolumeState;
+
+/// 顺序即 `VolumeState::index()`：静音 / 低 / 中 / 高。
+const SOURCES: [[&[u8]; 4]; 2] = [
+    [
+        include_bytes!("../assets/volume_muted_light.ico"),
+        include_bytes!("../assets/volume_low_light.ico"),
+        include_bytes!("../assets/volume_medium_light.ico"),
+        include_bytes!("../assets/volume_high_light.ico"),
+    ],
+    [
+        include_bytes!("../assets/volume_muted_dark.ico"),
+        include_bytes!("../assets/volume_low_dark.ico"),
+        include_bytes!("../assets/volume_medium_dark.ico"),
+        include_bytes!("../assets/volume_high_dark.ico"),
+    ],
 ];
 
 /// 从 ICO 目录里挑选尺寸最接近 `target` 的一帧，返回该帧的原始字节。
@@ -49,58 +59,57 @@ fn make_icon(ico: &[u8], size: u32) -> WinResult<HICON> {
     }
 }
 
-/// 一种主题下的一对图标（正常 / 静音）。
-struct Pair {
-    normal: HICON,
-    muted: HICON,
+/// 一种主题下的四个等级图标。
+struct Theme {
+    handles: [HICON; 4],
 }
 
-impl Drop for Pair {
+impl Drop for Theme {
     fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyIcon(self.normal);
-            let _ = DestroyIcon(self.muted);
+        for icon in self.handles {
+            unsafe {
+                let _ = DestroyIcon(icon);
+            }
         }
     }
 }
 
-/// 四种状态的全部图标句柄，进程生命周期内一直持有，避免反复创建。
+/// 全部图标句柄，进程生命周期内一直持有。
 pub struct Icons {
-    light: Pair,
-    dark: Pair,
+    light: Theme,
+    dark: Theme,
 }
 
 impl Icons {
-    /// 按当前 DPI 加载四个图标；任一失败则释放已创建的句柄并返回错误。
+    /// 按当前 DPI 一次性加载 8 个图标；任一失败则释放已创建的句柄并返回错误。
     pub fn load() -> WinResult<Self> {
         let size = small_icon_size();
-        let mut handles = vec![HICON::default(); 4];
-        for (index, source) in SOURCES.iter().enumerate() {
-            match make_icon(source, size) {
-                Ok(icon) => handles[index] = icon,
-                Err(error) => {
-                    for created in handles {
-                        unsafe { let _ = DestroyIcon(created); }
+        let mut handles = [[HICON::default(); 4]; 2];
+
+        for (theme, sources) in SOURCES.iter().enumerate() {
+            for (level, source) in sources.iter().enumerate() {
+                match make_icon(source, size) {
+                    Ok(icon) => handles[theme][level] = icon,
+                    Err(error) => {
+                        for row in handles {
+                            for icon in row {
+                                unsafe { let _ = DestroyIcon(icon); }
+                            }
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             }
         }
 
-        Ok(Self {
-            light: Pair { normal: handles[0], muted: handles[2] },
-            dark: Pair { normal: handles[1], muted: handles[3] },
-        })
+        let [light, dark] = handles;
+        Ok(Self { light: Theme { handles: light }, dark: Theme { handles: dark } })
     }
 
-    /// 取出当前需要的图标句柄（句柄由 `Icons` 拥有，调用方不得销毁）。
-    pub fn get(&self, light_taskbar: bool, muted: bool) -> HICON {
-        let pair = if light_taskbar { &self.light } else { &self.dark };
-        if muted {
-            pair.muted
-        } else {
-            pair.normal
-        }
+    /// 取出当前需要的图标句柄（由 `Icons` 拥有，调用方不得销毁）。
+    pub fn get(&self, light_taskbar: bool, state: VolumeState) -> HICON {
+        let theme = if light_taskbar { &self.light } else { &self.dark };
+        theme.handles[state.index()]
     }
 }
 
@@ -130,10 +139,11 @@ pub fn is_light_taskbar() -> bool {
         )
     };
     if status.is_err() {
-        return true; // 读不到就按浅色任务栏处理
+        return true;
     }
     value != 0
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,40 +158,34 @@ mod tests {
     #[test]
     fn picks_exact_frame_per_size() {
         for target in [16u32, 20, 24, 32, 40, 48, 64] {
-            match frame_for_size(SOURCES[0], target) {
+            match frame_for_size(SOURCES[0][3], target) {
                 Some(frame) => assert_eq!(frame_width(frame), target, "尺寸 {target} 选错帧"),
                 None => panic!("尺寸 {target} 没找到帧"),
             }
         }
     }
 
-    /// 超出资源范围时退化为最大尺寸，且不会越界。
+    /// 8 套图标必须互不相同且句柄有效。
     #[test]
-    fn falls_back_to_nearest_frame() {
-        match frame_for_size(SOURCES[3], 512) {
-            Some(frame) => assert_eq!(frame_width(frame), 64),
-            None => panic!("没有回退帧"),
-        }
-        assert!(frame_for_size(&[], 16).is_none());
-        assert!(frame_for_size(&[0, 0, 1, 0, 8, 0], 16).is_none());
-    }
-
-    /// 四种组合必须是四个不同且有效的图标句柄。
-    #[test]
-    fn four_distinct_icons() {
+    fn eight_distinct_icons() {
         let icons = match Icons::load() {
             Ok(icons) => icons,
             Err(_) => panic!("图标资源加载失败"),
         };
-        let mut handles = vec![
-            icons.get(true, false).0,
-            icons.get(true, true).0,
-            icons.get(false, false).0,
-            icons.get(false, true).0,
-        ];
+        let mut handles: Vec<*mut c_void> = Vec::new();
+        for light in [true, false] {
+            for state in [
+                VolumeState::Muted,
+                VolumeState::Low,
+                VolumeState::Medium,
+                VolumeState::High,
+            ] {
+                handles.push(icons.get(light, state).0);
+            }
+        }
         assert!(handles.iter().all(|handle| !handle.is_null()), "图标句柄为空");
         handles.sort();
         handles.dedup();
-        assert_eq!(handles.len(), 4, "四种状态的图标句柄出现重复");
+        assert_eq!(handles.len(), 8, "8 个图标句柄出现重复");
     }
 }

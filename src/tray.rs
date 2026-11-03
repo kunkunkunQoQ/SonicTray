@@ -4,7 +4,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
+    NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
@@ -33,12 +33,12 @@ impl Tray {
         Self { hwnd, added: false }
     }
 
-    fn data(&self, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
+    fn data(&self, icon: HICON, tip: &str, flags: NOTIFY_ICON_DATA_FLAGS) -> NOTIFYICONDATAW {
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: self.hwnd,
             uID: ICON_ID,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uFlags: flags,
             uCallbackMessage: WM_TRAYICON,
             hIcon: icon,
             ..Default::default()
@@ -57,15 +57,22 @@ impl Tray {
 
     /// 添加托盘图标。
     pub fn add(&mut self, icon: HICON, tip: &str) {
-        let ok = self.notify(NIM_ADD, &self.data(icon, tip));
-        self.added = ok;
+        self.added = self.notify(NIM_ADD, &self.data(icon, tip, NIF_MESSAGE | NIF_ICON | NIF_TIP));
     }
 
     /// 更新图标与提示文字；图标已丢失（如 Explorer 重启）时重新添加。
     pub fn update(&mut self, icon: HICON, tip: &str) {
-        if !self.added || !self.notify(NIM_MODIFY, &self.data(icon, tip)) {
+        if !self.added || !self.notify(NIM_MODIFY, &self.data(icon, tip, NIF_MESSAGE | NIF_ICON | NIF_TIP)) {
             self.add(icon, tip);
         }
+    }
+
+    /// 只更新悬停提示，不动图标句柄（音量等级未变时使用）。
+    pub fn update_tip(&mut self, tip: &str) {
+        if !self.added {
+            return;
+        }
+        self.notify(NIM_MODIFY, &self.data(HICON::default(), tip, NIF_TIP));
     }
 
     /// Explorer 重启后重新注册：先删后加，保证不会出现两个图标。
@@ -77,7 +84,7 @@ impl Tray {
     /// 退出前移除托盘图标。
     pub fn remove(&mut self) {
         if self.added {
-            self.notify(NIM_DELETE, &self.data(HICON::default(), ""));
+            self.notify(NIM_DELETE, &self.data(HICON::default(), "", NIF_MESSAGE));
             self.added = false;
         }
     }
