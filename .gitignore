@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Generated / resource compiler temporary files
+assets/RCa*
+assets/RCb*
+*.res
+
+# IDE / OS files
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

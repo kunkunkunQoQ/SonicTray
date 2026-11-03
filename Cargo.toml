@@ -1,0 +1,38 @@
+[package]
+name = "sonic-tray"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Windows 系统静音状态托盘指示器（Sonic Tray）"
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+name = "SonicTray"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+windows-core = "0.62"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

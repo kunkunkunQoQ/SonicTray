@@ -1,0 +1,35 @@
+#pragma code_page(65001)
+
+// 不用 windows.h：资源 ID 一律写数字（RT_ICON=1、RT_VERSION=1），
+// 这样 rc.exe 无需任何 SDK 头文件路径也能独立编译。
+
+1 ICON "app.ico"
+
+1 VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Sonic Tray"
+            VALUE "FileDescription", "Sonic Tray - 系统静音状态托盘指示器"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "SonicTray"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "SonicTray.exe"
+            VALUE "ProductName", "Sonic Tray"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
